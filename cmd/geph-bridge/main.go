@@ -17,6 +17,8 @@ import (
 	"github.com/geph-official/geph2/libs/cshirt2"
 	"github.com/geph-official/geph2/libs/kcp-go"
 	"github.com/geph-official/geph2/libs/niaucchi4"
+	"github.com/google/gops/agent"
+	"golang.org/x/time/rate"
 )
 
 var cookieSeed string
@@ -28,7 +30,10 @@ var exitRegex string
 var binderKey string
 var statsdAddr string
 var allocGroup string
+var speedLimit int
 var bclient *bdclient.Client
+
+var limiter *rate.Limiter
 
 var statClient *statsd.StatsdClient
 
@@ -39,7 +44,18 @@ func main() {
 	flag.StringVar(&statsdAddr, "statsdAddr", "c2.geph.io:8125", "address of StatsD for gathering statistics")
 	flag.StringVar(&binderKey, "binderKey", "", "binder API key")
 	flag.StringVar(&allocGroup, "allocGroup", "", "allocation group")
+	flag.IntVar(&speedLimit, "speedLimit", -1, "speed limit in KB/s")
 	flag.Parse()
+	if speedLimit > 0 {
+		limiter = rate.NewLimiter(rate.Limit(speedLimit*1024), 1000*1000)
+	} else {
+		limiter = rate.NewLimiter(rate.Inf, 1000*1000)
+	}
+	go func() {
+		if err := agent.Listen(agent.Options{}); err != nil {
+			log.Fatal(err)
+		}
+	}()
 	if allocGroup == "" {
 		log.Fatal("must specify an allocation group")
 	}
@@ -66,7 +82,7 @@ func main() {
 			statClient.Timing(allocGroup+".lossPct", RL)
 		}
 	}()
-	listenLoop()
+	listenLoop(-1)
 }
 
 func generateCookie() {
@@ -74,17 +90,17 @@ func generateCookie() {
 	rand.Read(cookie)
 }
 
-func listenLoop() {
+func listenLoop(deadline time.Duration) {
 	udpsock, err := net.ListenPacket("udp", ":")
 	if err != nil {
 		panic(err)
 	}
-	udpsock.(*net.UDPConn).SetWriteBuffer(1000 * 1000 * 10)
-	myAddr := fmt.Sprintf("%v:%v", guessIP(), udpsock.LocalAddr().(*net.UDPAddr).Port)
-	log.Println("server started UDP on", myAddr)
 	go func() {
-		for {
-			e := bclient.AddBridge(binderKey, cookie, myAddr)
+		end := time.Now().Add(deadline)
+		for deadline < 0 || time.Now().Before(end) {
+			myAddr := fmt.Sprintf("%v:%v", guessIP(), udpsock.LocalAddr().(*net.UDPAddr).Port)
+			log.Println(myAddr)
+			e := bclient.AddBridge(binderKey, cookie, myAddr, allocGroup)
 			if e != nil {
 				log.Println("error adding bridge:", e)
 			}
@@ -96,11 +112,19 @@ func listenLoop() {
 		if err != nil {
 			panic(err)
 		}
+		log.Println("Listen on", listener.Addr())
+		if deadline > 0 {
+			go func() {
+				time.Sleep(deadline)
+				listener.Close()
+			}()
+		}
+		defer listener.Close()
 		log.Println("N4/TCP listener spinned up")
 		for {
 			rawClient, err := listener.Accept()
 			if err != nil {
-				panic(err)
+				return
 			}
 			go func() {
 				defer rawClient.Close()
@@ -111,31 +135,40 @@ func listenLoop() {
 					log.Println("cshirt2 failed", err, rawClient.RemoteAddr())
 					return
 				}
-				log.Println("Accepted TCP from", rawClient.RemoteAddr())
+				//log.Println("Accepted TCP from", rawClient.RemoteAddr())
 				handle(client)
 			}()
 		}
 	}()
-	e2e := niaucchi4.ObfsListen(cookie, udpsock)
+	e2e := niaucchi4.ObfsListen(cookie, udpsock, false)
 	if err != nil {
 		panic(err)
 	}
 	listener := niaucchi4.ListenKCP(e2e)
 	log.Println("N4/UDP listener spinned up")
+	if deadline > 0 {
+		go func() {
+			time.Sleep(deadline)
+			listener.Close()
+		}()
+	}
+	defer listener.Close()
 	for {
 		client, err := listener.Accept()
 		if err != nil {
-			panic(err)
+			return
 		}
-		log.Println("Accepted UDP client", client.RemoteAddr())
+		//log.Println("Accepted UDP client", client.RemoteAddr())
 		go handle(client)
 	}
 }
 
 func guessIP() string {
+retry:
 	resp, err := http.Get("https://checkip.amazonaws.com")
 	if err != nil {
-		panic("stuck while getting our own IP: " + err.Error())
+		log.Println("stuck while getting our own IP:" + err.Error())
+		goto retry
 	}
 	buf := new(bytes.Buffer)
 	io.Copy(buf, resp.Body)

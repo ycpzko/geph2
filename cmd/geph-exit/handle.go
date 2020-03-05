@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"crypto/ed25519"
+	"fmt"
 	"io"
 	"io/ioutil"
 	"net"
@@ -29,6 +30,7 @@ func init() {
 		"10.0.0.0/8",
 		"172.16.0.0/12",
 		"192.168.0.0/16",
+		"::1/128",
 	} {
 		_, n, _ := net.ParseCIDR(s)
 		cidrBlacklist = append(cidrBlacklist, n)
@@ -44,6 +46,25 @@ func isBlack(addr *net.TCPAddr) bool {
 	return false
 }
 
+var sessCount uint64
+var tunnCount uint64
+
+func init() {
+	go func() {
+		for {
+			time.Sleep(time.Second * 10)
+			if statClient != nil {
+				statClient.Send(map[string]string{
+					hostname + ".sessionCount": fmt.Sprintf("%v|g", atomic.LoadUint64(&sessCount)),
+				}, 1)
+				statClient.Send(map[string]string{
+					hostname + ".tunnelCount": fmt.Sprintf("%v|g", atomic.LoadUint64(&tunnCount)),
+				}, 1)
+			}
+		}
+	}()
+}
+
 func handle(rawClient net.Conn) {
 	log.Debugf("[%v] accept", rawClient.RemoteAddr())
 	defer log.Debugf("[%v] close", rawClient.RemoteAddr())
@@ -55,6 +76,8 @@ func handle(rawClient net.Conn) {
 		return
 	}
 	defer tssClient.Close()
+	atomic.AddUint64(&sessCount, 1)
+	defer atomic.AddUint64(&sessCount, ^uint64(0))
 	// copy the streams while
 	var counter uint64
 	// HACK: it's bridged if the remote address has a dot in it
@@ -63,17 +86,64 @@ func handle(rawClient net.Conn) {
 	ssSignature := ed25519.Sign(seckey, tssClient.SharedSec())
 	rlp.Encode(tssClient, &ssSignature)
 	var limiter *rate.Limiter
-	limiter = rate.NewLimiter(10*1024*1024, 1*1000*1000)
+	limiter = rate.NewLimiter(rate.Limit(speedLimit*1024), speedLimit*1024)
 	// "generic" stuff
 	var acceptStream func() (net.Conn, error)
+	if singleHop == "" {
+		// authenticate the client
+		var greeting [2][]byte
+		err = rlp.Decode(tssClient, &greeting)
+		if err != nil {
+			log.Println("Error decoding greeting from", rawClient.RemoteAddr(), err)
+			return
+		}
+		err = bclient.RedeemTicket("paid", greeting[0], greeting[1])
+		if err != nil {
+			if onlyPaid {
+				log.Printf("%v isn't paid and we only accept paid. Failing!", rawClient.RemoteAddr())
+				rlp.Encode(tssClient, "FAIL")
+				return
+			}
+			err = bclient.RedeemTicket("free", greeting[0], greeting[1])
+			if err != nil {
+				log.Printf("%v isn't free either. fail", rawClient.RemoteAddr())
+				rlp.Encode(tssClient, "FAIL")
+				return
+			}
+			limiter = rate.NewLimiter(100*1000, 1*1000*1000)
+			limiter.WaitN(context.Background(), 1*1000*1000-500)
+		}
+		// IGNORE FOR NOW
+		rlp.Encode(tssClient, "OK")
+	}
 	switch tssClient.NextProt() {
 	case 0:
 		// create smux context
 		muxSrv, err := smux.Server(tssClient, &smux.Config{
-			KeepAliveInterval: time.Minute * 9,
-			KeepAliveTimeout:  time.Minute * 10,
+			Version:           1,
+			KeepAliveInterval: time.Minute * 10,
+			KeepAliveTimeout:  time.Minute * 40,
 			MaxFrameSize:      8192,
-			MaxReceiveBuffer:  10 * 1024 * 1024,
+			MaxReceiveBuffer:  100 * 1024 * 1024,
+			MaxStreamBuffer:   10 * 1024 * 1024,
+		})
+		if err != nil {
+			log.Println("Error negotiating smux from", rawClient.RemoteAddr(), err)
+			return
+		}
+		acceptStream = func() (n net.Conn, e error) {
+			n, e = muxSrv.AcceptStream()
+			return
+		}
+	case 2:
+		// create smux context
+		muxSrv, err := smux.Server(tssClient, &smux.Config{
+			Version:           2,
+			KeepAliveInterval: time.Minute * 2,
+			KeepAliveTimeout:  time.Minute * 20,
+			MaxFrameSize:      32768,
+			MaxReceiveBuffer:  100 * 1024 * 1024,
+			MaxStreamBuffer:   100 * 1024 * 1024,
 		})
 		if err != nil {
 			log.Println("Error negotiating smux from", rawClient.RemoteAddr(), err)
@@ -102,33 +172,6 @@ func handle(rawClient net.Conn) {
 			return
 		}
 	}
-	if singleHop == "" {
-		// authenticate the client
-		var greeting [2][]byte
-		err = rlp.Decode(tssClient, &greeting)
-		if err != nil {
-			log.Println("Error decoding greeting from", rawClient.RemoteAddr(), err)
-			return
-		}
-		err = bclient.RedeemTicket("paid", greeting[0], greeting[1])
-		if err != nil {
-			if onlyPaid {
-				log.Printf("%v isn't paid and we only accept paid. Failing!", rawClient.RemoteAddr())
-				rlp.Encode(tssClient, "FAIL")
-				return
-			}
-			err = bclient.RedeemTicket("free", greeting[0], greeting[1])
-			if err != nil {
-				log.Printf("%v isn't free either. fail", rawClient.RemoteAddr())
-				rlp.Encode(tssClient, "FAIL")
-				return
-			}
-			limiter = rate.NewLimiter(100*1000, 1*1000*1000)
-			limiter.WaitN(context.Background(), 1*1000*1000-500)
-		}
-		// IGNORE FOR NOW
-		rlp.Encode(tssClient, "OK")
-	}
 	rawClient.SetDeadline(time.Now().Add(time.Hour * 24))
 	for {
 		soxclient, err := acceptStream()
@@ -147,7 +190,7 @@ func handle(rawClient net.Conn) {
 				return
 			}
 			soxclient.SetDeadline(time.Time{})
-			log.Debugf("[%v] cmd %v", rawClient.RemoteAddr(), command)
+			log.Debugf("<%v> cmd %v", atomic.LoadUint64(&tunnCount), command)
 			// match command
 			switch command[0] {
 			case "proxy":
@@ -157,27 +200,32 @@ func handle(rawClient net.Conn) {
 				rlp.Encode(soxclient, true)
 				dialStart := time.Now()
 				host := command[1]
-				tcpAddr, err := net.ResolveTCPAddr("tcp4", host)
-				if err != nil || isBlack(tcpAddr) {
+				var remote net.Conn
+				for _, ntype := range []string{"tcp6", "tcp4"} {
+					tcpAddr, err := net.ResolveTCPAddr(ntype, host)
+					if err != nil || isBlack(tcpAddr) {
+						continue
+					}
+					remote, err = net.DialTimeout(ntype, tcpAddr.String(), time.Second*30)
+					if err != nil {
+						continue
+					}
+					break
+				}
+				if remote == nil {
 					return
 				}
-				remote, err := net.DialTimeout("tcp", tcpAddr.String(), time.Second*30)
-				if err != nil {
-					return
-				}
+				atomic.AddUint64(&tunnCount, 1)
+				defer atomic.AddUint64(&tunnCount, ^uint64(0))
+				regConn(remote)
 				// measure dial latency
 				dialLatency := time.Since(dialStart)
-				if statClient != nil && singleHop == "" {
+				if statClient != nil && singleHop == "" && reportRL.Allow() {
 					statClient.Timing(hostname+".dialLatency", dialLatency.Milliseconds())
-					statClient.Increment(hostname + ".totalConns")
-					defer func() {
-						statClient.Timing(hostname+".connLifetime", dialLatency.Milliseconds())
-					}()
 				}
-
-				remote.SetDeadline(time.Now().Add(time.Hour))
 				defer remote.Close()
 				onPacket := func(l int) {
+					regConn(remote)
 					if statClient != nil && singleHop == "" {
 						before := atomic.LoadUint64(&counter)
 						atomic.AddUint64(&counter, uint64(l))
@@ -190,9 +238,9 @@ func handle(rawClient net.Conn) {
 				go func() {
 					defer remote.Close()
 					defer soxclient.Close()
-					cwl.CopyWithLimit(remote, soxclient, limiter, onPacket)
+					cwl.CopyWithLimit(remote, soxclient, limiter, onPacket, time.Hour)
 				}()
-				cwl.CopyWithLimit(soxclient, remote, limiter, onPacket)
+				cwl.CopyWithLimit(soxclient, remote, limiter, onPacket, time.Hour)
 			case "ip":
 				var ip string
 				if ipi, ok := ipcache.Get("ip"); ok {
@@ -209,6 +257,7 @@ func handle(rawClient net.Conn) {
 						return
 					}
 					ip = string(ipb)
+					ipcache.SetDefault("ip", ip)
 				}
 				rlp.Encode(soxclient, true)
 				rlp.Encode(soxclient, ip)

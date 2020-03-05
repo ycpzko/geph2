@@ -64,8 +64,8 @@ func (cl *Client) GetClientInfo() (ui ClientInfo, err error) {
 }
 
 // AddBridge uploads some bridge info.
-func (cl *Client) AddBridge(secret string, cookie []byte, host string) (err error) {
-	req, _ := http.NewRequest("GET", fmt.Sprintf("%v/add-bridge?cookie=%x&host=%v", cl.frontDomain, cookie, host), bytes.NewReader(nil))
+func (cl *Client) AddBridge(secret string, cookie []byte, host string, allocGroup string) (err error) {
+	req, _ := http.NewRequest("GET", fmt.Sprintf("%v/add-bridge?cookie=%x&host=%v&allocGroup=%v", cl.frontDomain, cookie, host, allocGroup), bytes.NewReader(nil))
 	req.Host = cl.realDomain
 	req.SetBasicAuth("user", secret)
 	resp, err := cl.hclient.Do(req)
@@ -202,6 +202,23 @@ type BridgeInfo struct {
 // GetBridges obtains a set of bridges.
 func (cl *Client) GetBridges(ubmsg, ubsig []byte) (bridges []BridgeInfo, err error) {
 	req, _ := http.NewRequest("GET", fmt.Sprintf("%v/get-bridges", cl.frontDomain), bytes.NewReader(nil))
+	req.Host = cl.realDomain
+	resp, err := cl.hclient.Do(req)
+	if err != nil {
+		return
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		err = badStatusCode(resp.StatusCode)
+		return
+	}
+	err = json.NewDecoder(resp.Body).Decode(&bridges)
+	return
+}
+
+// GetEphBridges obtains a set of ephemeral e2e bridges.
+func (cl *Client) GetEphBridges(ubmsg []byte, ubsig []byte, exit string) (bridges []BridgeInfo, err error) {
+	req, _ := http.NewRequest("GET", fmt.Sprintf("%v/get-bridges?type=ephemeral&exit=%v", cl.frontDomain, exit), bytes.NewReader(nil))
 	req.Host = cl.realDomain
 	resp, err := cl.hclient.Do(req)
 	if err != nil {

@@ -34,6 +34,7 @@ func (sw *muxWrap) DialCmd(cmds ...string) (conn net.Conn, ok bool) {
 		sess := sw.fixSess()
 		// markSessionNil marks the session nil only if it hasn't already been changed
 		markSessionNil := func() {
+			time.Sleep(time.Second)
 			sw.lock.Lock()
 			if sw.session == sess {
 				sw.session = nil
@@ -45,11 +46,12 @@ func (sw *muxWrap) DialCmd(cmds ...string) (conn net.Conn, ok bool) {
 			sess.Close()
 			log.Warnln(cmds, "can't open stream, trying again", err)
 			markSessionNil()
+			time.Sleep(time.Second)
 			goto start
 		}
 		// dial command
 		rlp.Encode(strm, cmds)
-		strm.SetDeadline(time.Now().Add(time.Second * 20))
+		strm.SetDeadline(time.Now().Add(time.Second * 8))
 		// wait for response
 		var connected bool
 		err = rlp.Decode(strm, &connected)
@@ -57,6 +59,7 @@ func (sw *muxWrap) DialCmd(cmds ...string) (conn net.Conn, ok bool) {
 			sess.Close()
 			markSessionNil()
 			log.Warnln(cmds, "can't read response, trying again:", err)
+			time.Sleep(time.Second)
 			goto start
 		}
 		select {

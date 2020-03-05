@@ -12,8 +12,11 @@ import (
 	"github.com/patrickmn/go-cache"
 )
 
-// ErrAttackDetected denotes an error that can only happen when active probing attempts are made. The remote IP should probably be blocked!
+// ErrAttackDetected denotes an error that can only happen when active probing attempts are made.
 var ErrAttackDetected = errors.New("active probing attack detected")
+
+// ErrBadHandshakeMAC denotes a bad handshake mac.
+var ErrBadHandshakeMAC = errors.New("bad MAC in handshake")
 
 func mac256(m, k []byte) []byte {
 	mac := blake2b.NewMAC(32, k)
@@ -31,40 +34,44 @@ var (
 	globCache = cache.New(time.Minute*10, time.Minute*10)
 )
 
-func readPK(secret []byte, transport net.Conn) (dhPK, error) {
+func readPK(secret []byte, transport net.Conn) (dhPK, int64, error) {
 	// Read their public key
 	theirPublic := make([]byte, 1536/8)
 	_, err := io.ReadFull(transport, theirPublic)
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 	// Reject if bad
 	if _, ok := globCache.Get(string(theirPublic)); ok {
-		return nil, ErrAttackDetected
+		return nil, 0, ErrAttackDetected
 	}
+	globCache.SetDefault(string(theirPublic), true)
 	// Read their public key MAC
 	theirPublicMAC := make([]byte, 32)
 	_, err = io.ReadFull(transport, theirPublicMAC)
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 	macOK := false
 	epoch := time.Now().Unix() / 30
 	for e := epoch - 10; e < epoch+10; e++ {
-		macKey := mac256(secret, []byte(fmt.Sprintf("%v", epoch)))
+		macKey := mac256(secret, []byte(fmt.Sprintf("%v", e)))
 		if subtle.ConstantTimeCompare(theirPublicMAC, mac256(theirPublic, macKey)) == 1 {
 			macOK = true
+			epoch = e
 			break
 		}
 	}
 	if !macOK {
-		return nil, ErrAttackDetected
+		return nil, 0, ErrBadHandshakeMAC
 	}
-	return theirPublic, nil
+	return theirPublic, epoch, nil
 }
 
-func writePK(secret []byte, myPublic dhPK, transport net.Conn) error {
-	epoch := time.Now().Unix() / 30
+func writePK(epoch int64, secret []byte, myPublic dhPK, transport net.Conn) error {
+	if epoch == 0 {
+		epoch = time.Now().Unix() / 30
+	}
 	macKey := mac256(secret, []byte(fmt.Sprintf("%v", epoch)))
 	myPublicMAC := mac256(myPublic, macKey)
 	_, err := transport.Write(myPublic)
@@ -80,12 +87,12 @@ func writePK(secret []byte, myPublic dhPK, transport net.Conn) error {
 
 // Server negotiates obfuscation on a network connection, acting as the server. The secret must be provided.
 func Server(secret []byte, transport net.Conn) (net.Conn, error) {
-	theirPK, err := readPK(secret, transport)
+	theirPK, epoch, err := readPK(secret, transport)
 	if err != nil {
 		return nil, err
 	}
 	myPK, mySK := dhGenKey()
-	err = writePK(secret, myPK, transport)
+	err = writePK(epoch, secret, myPK, transport)
 	if err != nil {
 		return nil, err
 	}
@@ -98,11 +105,11 @@ func Server(secret []byte, transport net.Conn) (net.Conn, error) {
 // secret must be given so that the client can prove knowledge.
 func Client(secret []byte, transport net.Conn) (net.Conn, error) {
 	myPK, mySK := dhGenKey()
-	err := writePK(secret, myPK, transport)
+	err := writePK(0, secret, myPK, transport)
 	if err != nil {
 		return nil, err
 	}
-	theirPK, err := readPK(secret, transport)
+	theirPK, _, err := readPK(secret, transport)
 	if err != nil {
 		return nil, err
 	}

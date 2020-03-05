@@ -1,6 +1,7 @@
 package niaucchi4
 
 import (
+	"bytes"
 	"crypto/rand"
 	"encoding/hex"
 	"errors"
@@ -105,15 +106,34 @@ func (e2e *E2EConn) WriteTo(p []byte, addr net.Addr) (n int, err error) {
 	sess := sessi.(*e2eSession)
 	e2e.sidToSess.SetDefault(sessid.String(), sess)
 	err = sess.Send(p, func(toSend e2ePacket, dest net.Addr) {
-		tsBts, err := rlp.EncodeToBytes(toSend)
+		buffer := malloc(2048)
+		defer free(buffer)
+		buf := bytes.NewBuffer(buffer[:0])
+		err = rlp.Encode(buf, toSend)
 		if err != nil {
 			panic(err)
 		}
-		e2e.wire.WriteTo(tsBts, dest)
+		e2e.wire.WriteTo(buf.Bytes(), dest)
 	})
 	if err != nil {
 		return
 	}
+	return
+}
+
+// UnderlyingLoss returns the underlying loss.
+func (e2e *E2EConn) UnderlyingLoss(destAddr net.Addr) (frac float64) {
+	sessid := destAddr.(SessionAddr)
+	sessi, ok := e2e.sidToSess.Get(sessid.String())
+	if !ok {
+		log.Println("cannot find underlying loss")
+		return
+	}
+	sess := sessi.(*e2eSession)
+	sess.lock.Lock()
+	defer sess.lock.Unlock()
+	rem := sess.info[sess.lastRemid]
+	frac = rem.remoteLoss
 	return
 }
 

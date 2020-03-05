@@ -14,6 +14,7 @@ import (
 	log "github.com/sirupsen/logrus"
 
 	"github.com/ethereum/go-ethereum/rlp"
+	"github.com/geph-official/geph2/libs/bdclient"
 	"github.com/geph-official/geph2/libs/cshirt2"
 	"github.com/geph-official/geph2/libs/tinyss"
 	"github.com/xtaci/smux"
@@ -21,7 +22,7 @@ import (
 
 func negotiateSmux(greeting *[2][]byte, rawConn net.Conn, pk []byte) (ss *smux.Session, err error) {
 	rawConn.SetDeadline(time.Now().Add(time.Second * 20))
-	cryptConn, err := tinyss.Handshake(rawConn, 0)
+	cryptConn, err := tinyss.Handshake(rawConn, 2)
 	if err != nil {
 		err = fmt.Errorf("tinyss handshake failed: %w", err)
 		rawConn.Close()
@@ -59,10 +60,12 @@ func negotiateSmux(greeting *[2][]byte, rawConn net.Conn, pk []byte) (ss *smux.S
 		}
 	}
 	smuxConf := &smux.Config{
-		KeepAliveInterval: time.Minute * 20,
-		KeepAliveTimeout:  time.Minute * 22,
-		MaxFrameSize:      4096,
+		Version:           2,
+		KeepAliveInterval: time.Minute * 5,
+		KeepAliveTimeout:  time.Minute * 30,
+		MaxFrameSize:      32768,
 		MaxReceiveBuffer:  100 * 1024 * 1024,
+		MaxStreamBuffer:   100 * 1024 * 1024,
 	}
 	ss, err = smux.Client(cryptConn, smuxConf)
 	if err != nil {
@@ -70,7 +73,7 @@ func negotiateSmux(greeting *[2][]byte, rawConn net.Conn, pk []byte) (ss *smux.S
 		err = fmt.Errorf("smux error: %w", err)
 		return
 	}
-	rawConn.SetDeadline(time.Now().Add(time.Hour * 12))
+	rawConn.SetDeadline(time.Now().Add(time.Hour * 24))
 	return
 }
 
@@ -104,6 +107,9 @@ func newSmuxWrapper() *muxWrap {
 				time.Sleep(time.Second)
 				goto retry
 			}
+			if loginCheck {
+				os.Exit(0)
+			}
 			useStats(func(sc *stats) {
 				sc.Username = username
 				sc.Expiry = details.PaidExpiry
@@ -126,11 +132,21 @@ func newSmuxWrapper() *muxWrap {
 				})
 				return sm
 			}
-			bridges, err := bindClient.GetBridges(ubmsg, ubsig)
-			if err != nil {
-				log.Warnln("getting bridges failed, retrying", err)
-				time.Sleep(time.Second)
-				goto retry
+			var bridges []bdclient.BridgeInfo
+			if useTCP {
+				bridges, err = bindClient.GetBridges(ubmsg, ubsig)
+				if err != nil {
+					log.Warnln("getting bridges failed, retrying", err)
+					time.Sleep(time.Second)
+					goto retry
+				}
+			} else {
+				bridges, err = bindClient.GetEphBridges(ubmsg, ubsig, exitName)
+				if err != nil {
+					log.Warnln("getting ephemeral bridges failed, retrying", err)
+					time.Sleep(time.Second)
+					goto retry
+				}
 			}
 			log.Infoln("Obtained", len(bridges), "bridges")
 			for _, b := range bridges {
@@ -144,9 +160,9 @@ func newSmuxWrapper() *muxWrap {
 					goto retry
 				}
 			} else {
-				conn, err = getMultipath(bridges)
+				conn, err = getMultipath(bridges, false)
 				if err != nil {
-					log.Println("Singlepath failed!")
+					log.Println("Multipath failed!")
 					goto retry
 				}
 			}
@@ -156,7 +172,7 @@ func newSmuxWrapper() *muxWrap {
 				conn.Close()
 				goto retry
 			}
-			conn.SetDeadline(time.Now().Add(time.Hour * 6))
+			conn.SetDeadline(time.Now().Add(time.Hour * 24))
 			return sm
 		} else {
 			splitted := strings.Split(singleHop, "@")

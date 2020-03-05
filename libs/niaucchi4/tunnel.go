@@ -12,10 +12,21 @@ import (
 	mrand "math/rand"
 	"time"
 
+	"github.com/ethereum/go-ethereum/rlp"
 	"github.com/geph-official/geph2/libs/c25519"
 	"golang.org/x/crypto/chacha20poly1305"
 	"golang.org/x/crypto/curve25519"
 )
+
+var masterSec = make([]byte, 32)
+
+func genSK(seed []byte) [32]byte {
+	return c25519.GenSKWithSeed(append(seed, masterSec...))
+}
+
+func init() {
+	rand.Read(masterSec)
+}
 
 func hm(m, k []byte) []byte {
 	h := hmac.New(sha256.New, k)
@@ -24,10 +35,12 @@ func hm(m, k []byte) []byte {
 }
 
 type tunstate struct {
-	enc    cipher.AEAD
-	dec    cipher.AEAD
-	ss     []byte
-	isserv bool
+	enc              cipher.AEAD
+	dec              cipher.AEAD
+	ss               []byte
+	isserv           bool
+	replayProtection bool
+	rw               replayWindow
 }
 
 func (ts *tunstate) deriveKeys(ss []byte) {
@@ -54,6 +67,17 @@ func (ts *tunstate) Decrypt(pkt []byte) (bts []byte, err error) {
 	if err != nil {
 		return
 	}
+	if ts.replayProtection {
+		var e2epkt e2ePacket
+		err = rlp.DecodeBytes(bts, &e2epkt)
+		if err != nil {
+			return
+		}
+		if !ts.rw.check(e2epkt.Sn) {
+			err = errors.New("blocking replay")
+			return
+		}
+	}
 	return
 }
 
@@ -69,7 +93,7 @@ type prototun struct {
 	cookie []byte
 }
 
-func (pt *prototun) realize(response []byte, isserv bool) (ts *tunstate, err error) {
+func (pt *prototun) realize(response []byte, isserv bool, replayProtection bool) (ts *tunstate, err error) {
 	// decode their hello
 	var theirHello helloPkt
 	err = binary.Read(bytes.NewReader(response), binary.BigEndian, &theirHello)
@@ -90,10 +114,14 @@ func (pt *prototun) realize(response []byte, isserv bool) (ts *tunstate, err err
 		var sharedsec [32]byte
 		var theirPKf [32]byte
 		copy(theirPKf[:], theirPK)
+		if isserv {
+			pt.mySK = genSK(theirPKf[:])
+		}
 		curve25519.ScalarMult(&sharedsec, &pt.mySK, &theirPKf)
 		// make ts
 		ts = &tunstate{
-			isserv: isserv,
+			isserv:           isserv,
+			replayProtection: replayProtection,
 		}
 		ts.deriveKeys(sharedsec[:])
 		return

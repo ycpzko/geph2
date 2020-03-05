@@ -9,6 +9,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/geph-official/geph2/libs/fastudp"
 	"github.com/geph-official/geph2/libs/kcp-go"
 	"github.com/geph-official/geph2/libs/niaucchi4"
 	"golang.org/x/time/rate"
@@ -42,23 +43,28 @@ func main() {
 
 func mainClient(dialto string) {
 	udpsock := niaucchi4.Wrap(func() net.PacketConn {
-		udpsockR, err := net.ListenPacket("udp", "")
+		udpsockR, err := net.ListenPacket("udp4", "")
 		if err != nil {
 			panic(err)
 		}
-		return udpsockR
+		// udpsockR.(*net.UDPConn).SetWriteBuffer(10 * 1024 * 1024)
+		//udpsockR.(*net.UDPConn).SetReadBuffer(10 * 1024 * 1024)
+		return fastudp.NewConn(udpsockR.(*net.UDPConn))
 	})
-	servAddr, err := net.ResolveUDPAddr("udp", dialto)
+	servAddr, err := net.ResolveUDPAddr("udp4", dialto)
 	if err != nil {
 		panic(err)
 	}
-	kcpremote, err := kcp.NewConn2(servAddr, nil, 0, 0, niaucchi4.ObfsListen(nil, udpsock))
+	e2e := niaucchi4.NewE2EConn(niaucchi4.ObfsListen(nil, udpsock, true))
+	var sid niaucchi4.SessionAddr
+	e2e.SetSessPath(sid, servAddr)
+	kcpremote, err := kcp.NewConn2(sid, nil, 16, 16, e2e)
 	if err != nil {
 		panic(err)
 	}
 	defer kcpremote.Close()
 	kcpremote.SetWindowSize(10000, 10000)
-	kcpremote.SetNoDelay(0, 50, 3, 0)
+	kcpremote.SetNoDelay(0, 100, 32, 0)
 	kcpremote.SetStreamMode(true)
 	kcpremote.SetMtu(1200)
 	kcpremote.Write([]byte("HELLO"))
@@ -87,15 +93,18 @@ func mainServer(listen string, klimit int) {
 	if klimit > 0 {
 		limiter = rate.NewLimiter(rate.Limit(klimit*1024), 1024*1024)
 	}
-	udpsock, err := net.ListenPacket("udp", listen)
+	udpsock, err := net.ListenPacket("udp4", listen)
 	if err != nil {
 		panic(err)
 	}
-	obfs := niaucchi4.ObfsListen(nil, udpsock)
+	udpsock.(*net.UDPConn).SetWriteBuffer(10 * 1024 * 1024)
+	udpsock.(*net.UDPConn).SetReadBuffer(10 * 1024 * 1024)
+	obfs := niaucchi4.ObfsListen(nil, udpsock, true)
 	if err != nil {
 		panic(err)
 	}
-	listener, err := kcp.ServeConn(nil, 0, 0, obfs)
+	e2e := niaucchi4.NewE2EConn(obfs)
+	listener, err := kcp.ServeConn(nil, 16, 16, e2e)
 	if err != nil {
 		panic(err)
 	}
@@ -107,7 +116,7 @@ func mainServer(listen string, klimit int) {
 		}
 		log.Println("Accepted kclient from", kclient.RemoteAddr())
 		kclient.SetWindowSize(10000, 10000)
-		kclient.SetNoDelay(0, 10, 3, 0)
+		kclient.SetNoDelay(0, 100, 32, 0)
 		kclient.SetStreamMode(true)
 		kclient.SetMtu(1200)
 		go func() {

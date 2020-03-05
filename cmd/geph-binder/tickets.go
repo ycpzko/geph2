@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"log"
 	"net/http"
+	"runtime"
 	"sort"
 	"time"
 
@@ -36,6 +37,12 @@ func handleGetTier(w http.ResponseWriter, r *http.Request) {
 	} else {
 		w.Write([]byte("free"))
 	}
+}
+
+var cpuSemaphore chan bool
+
+func init() {
+	cpuSemaphore = make(chan bool, runtime.GOMAXPROCS(0)*2)
 }
 
 func handleGetTicket(w http.ResponseWriter, r *http.Request) {

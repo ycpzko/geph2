@@ -10,12 +10,12 @@ import (
 	"net/http/httputil"
 	"net/url"
 	"os"
-	"os/signal"
+	"os/user"
 	"runtime/debug"
-	"runtime/pprof"
 	"strings"
-	"syscall"
 	"time"
+
+	"github.com/vharitonsky/iniflags"
 
 	"github.com/acarl005/stripansi"
 	"github.com/ethereum/go-ethereum/rlp"
@@ -44,15 +44,15 @@ var socksAddr string
 var httpAddr string
 var statsAddr string
 var dnsAddr string
-var cachePath string
+var fakeDNS bool
+var bypassChinese bool
 
 var useTCP bool
+var noFEC bool
 
 var singleHop string
 
 var bindClient *bdclient.Client
-
-var cpuprofile = flag.String("cpuprofile", "", "write cpu profile to `file`")
 
 var sWrap *muxWrap
 
@@ -92,6 +92,7 @@ restart:
 }
 
 func main() {
+	debug.SetGCPercent(30)
 	mrand.Seed(time.Now().UnixNano())
 	log.SetFormatter(&log.TextFormatter{
 		FullTimestamp: false,
@@ -99,6 +100,18 @@ func main() {
 	})
 	log.SetLevel(log.DebugLevel)
 	kcp.CongestionControl = "BIC"
+
+	// configfile path
+	usr, err := user.Current()
+	if err != nil {
+		log.Println("cannot read current user info, consider using -config=/path/to/cfgfile")
+	} else {
+		// default config file: $HOME/.config/client.conf, make sure chmod 600!
+		// use -config=/path/to/cfgfile to override
+		iniflags.SetConfigFile(usr.HomeDir + "/.config/client.conf")
+		iniflags.SetAllowMissingConfigFile(true)
+	}
+
 	// flags
 	flag.StringVar(&username, "username", "", "username")
 	flag.StringVar(&password, "password", "", "password")
@@ -112,30 +125,19 @@ func main() {
 	flag.StringVar(&httpAddr, "httpAddr", "localhost:9910", "HTTP proxy listener")
 	flag.StringVar(&statsAddr, "statsAddr", "localhost:9809", "HTTP listener for statistics")
 	flag.StringVar(&dnsAddr, "dnsAddr", "localhost:9983", "local DNS listener")
+	flag.BoolVar(&fakeDNS, "fakeDNS", true, "return fake results for DNS")
 	flag.BoolVar(&loginCheck, "loginCheck", false, "do a login check and immediately exit with code 0")
 	flag.StringVar(&binderProxy, "binderProxy", "", "if set, proxy the binder at the given listening address and do nothing else")
-	flag.StringVar(&cachePath, "cachePath", os.TempDir()+"/geph-cache.db", "location of state cache")
+	// flag.StringVar(&cachePath, "cachePath", os.TempDir()+"/geph-cache.db", "location of state cache")
 	flag.StringVar(&singleHop, "singleHop", "", "if set in form pk@host:port, location of a single-hop server. OVERRIDES BINDER AND AUTHENTICATION!")
 	flag.BoolVar(&useTCP, "useTCP", false, "use TCP to connect to bridges")
-	flag.Parse()
-	if *cpuprofile != "" {
-		f, err := os.Create(*cpuprofile)
-		if err != nil {
-			log.Fatal("could not create CPU profile: ", err)
-		}
-		c := make(chan os.Signal)
-		signal.Notify(c, os.Interrupt, syscall.SIGTERM)
-		if err := pprof.StartCPUProfile(f); err != nil {
-			log.Fatal("could not start CPU profile: ", err)
-		}
-		go func() {
-			<-c
-			pprof.StopCPUProfile()
-			f.Close()
-			debug.SetTraceback("all")
-			panic("TB")
-		}()
+	flag.BoolVar(&noFEC, "noFEC", false, "disable automatic FEC")
+	flag.BoolVar(&bypassChinese, "bypassChinese", false, "bypass proxy for Chinese domains")
+	iniflags.Parse()
+	if dnsAddr != "" {
+		go doDNS()
 	}
+	go listenStats()
 	if GitVersion == "" {
 		GitVersion = "NOVER"
 	}
@@ -203,7 +205,7 @@ func main() {
 				log.Println("cannot get country, conservatively using bridges", err)
 			} else {
 				log.Println("country is", country.Country)
-				if country.Country == "CN" || country.Country == "" {
+				if country.Country == "CN" {
 					log.Println("in CHINA, must use bridges")
 				} else {
 					log.Println("disabling bridges")
@@ -215,11 +217,6 @@ func main() {
 		}
 	}
 	sWrap = newSmuxWrapper()
-
-	if dnsAddr != "" {
-		go doDNSProxy()
-	}
-	go listenStats()
 
 	// confirm we are connected
 	func() {
@@ -238,9 +235,6 @@ func main() {
 				sc.Connected = true
 				sc.PublicIP = ip
 			})
-			if loginCheck {
-				os.Exit(0)
-			}
 			return
 		}
 	}()
@@ -249,7 +243,7 @@ func main() {
 }
 
 func dialTun(dest string) (conn net.Conn, err error) {
-	sks, err := proxy.SOCKS5("tcp", "127.0.0.1:9909", nil, proxy.Direct)
+	sks, err := proxy.SOCKS5("tcp", socksAddr, nil, proxy.Direct)
 	if err != nil {
 		return
 	}
