@@ -45,7 +45,7 @@ func main() {
 	})
 	log.SetLevel(log.DebugLevel)
 	flag.StringVar(&keyfile, "keyfile", "keyfile.bin", "location of key file")
-	flag.StringVar(&binderFront, "binderFront", "http://binder.geph.io:9080", "binder domain-fronting host")
+	flag.StringVar(&binderFront, "binderFront", "https://binder.geph.io/v2", "binder domain-fronting host")
 	flag.StringVar(&binderReal, "binderReal", "binder.geph.io", "real hostname of the binder")
 	flag.StringVar(&statsdAddr, "statsdAddr", "c2.geph.io:8125", "address of StatsD for gathering statistics")
 	flag.BoolVar(&onlyPaid, "onlyPaid", false, "only allow paying users")
@@ -110,7 +110,7 @@ func main() {
 			continue
 		}
 		rc.SetWindowSize(10000, 10000)
-		rc.SetNoDelay(0, 10, 32, 0)
+		rc.SetNoDelay(0, 100, 32, 0)
 		rc.SetStreamMode(true)
 		rc.SetMtu(1300)
 		go handle(rc)
@@ -135,7 +135,7 @@ func e2elisten() {
 			continue
 		}
 		rc.SetWindowSize(10000, 10000)
-		rc.SetNoDelay(0, 100, 8, 0)
+		rc.SetNoDelay(0, 100, 32, 0)
 		rc.SetStreamMode(true)
 		rc.SetMtu(1300)
 		go handle(rc)
