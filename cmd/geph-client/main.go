@@ -47,14 +47,11 @@ var dnsAddr string
 var fakeDNS bool
 var bypassChinese bool
 
-var useTCP bool
-var noFEC bool
-
 var singleHop string
 
 var bindClient *bdclient.Client
 
-var sWrap *muxWrap
+var sWrap commandDialer
 
 // GitVersion is the build version
 var GitVersion string
@@ -130,8 +127,6 @@ func main() {
 	flag.StringVar(&binderProxy, "binderProxy", "", "if set, proxy the binder at the given listening address and do nothing else")
 	// flag.StringVar(&cachePath, "cachePath", os.TempDir()+"/geph-cache.db", "location of state cache")
 	flag.StringVar(&singleHop, "singleHop", "", "if set in form pk@host:port, location of a single-hop server. OVERRIDES BINDER AND AUTHENTICATION!")
-	flag.BoolVar(&useTCP, "useTCP", false, "use TCP to connect to bridges")
-	flag.BoolVar(&noFEC, "noFEC", false, "disable automatic FEC")
 	flag.BoolVar(&bypassChinese, "bypassChinese", false, "bypass proxy for Chinese domains")
 	iniflags.Parse()
 	if dnsAddr != "" {
@@ -216,12 +211,17 @@ func main() {
 			direct = false
 		}
 	}
-	sWrap = newSmuxWrapper()
+	sWrap = newMultipool()
 
 	// confirm we are connected
 	func() {
 		for {
-			rm, _ := sWrap.DialCmd("ip")
+			rm, ok := sWrap.DialCmd("ip")
+			if !ok {
+				log.Println("FAILED to get IP, retrying...")
+				time.Sleep(time.Second)
+				continue
+			}
 			defer rm.Close()
 			var ip string
 			err := rlp.Decode(rm, &ip)
