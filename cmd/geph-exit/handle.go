@@ -126,6 +126,7 @@ func handle(rawClient net.Conn) {
 		rlp.Encode(tssClient, "OK")
 	}
 	rawClient.SetDeadline(time.Now().Add(time.Hour * 24))
+	sessid := fmt.Sprintf("%v", strings.Split(tssClient.RemoteAddr().String(), ":")[0])
 	switch tssClient.NextProt() {
 	case 0:
 		defer tssClient.Close()
@@ -135,8 +136,8 @@ func handle(rawClient net.Conn) {
 			KeepAliveInterval: time.Minute * 10,
 			KeepAliveTimeout:  time.Minute * 40,
 			MaxFrameSize:      8192,
-			MaxReceiveBuffer:  100 * 1024 * 1024,
-			MaxStreamBuffer:   10 * 1024 * 1024,
+			MaxReceiveBuffer:  100 * 1024,
+			MaxStreamBuffer:   100 * 1024,
 		})
 		if err != nil {
 			log.Println("Error negotiating smux from", rawClient.RemoteAddr(), err)
@@ -184,6 +185,28 @@ func handle(rawClient net.Conn) {
 			n, e = muxSrv.AcceptStream()
 			return
 		}
+	case 'N':
+		defer tssClient.Close()
+		buf := make([]byte, 32)
+		io.ReadFull(tssClient, buf)
+		sessid = fmt.Sprintf("%x", buf)
+		// create smux context
+		muxSrv, err := smux.Server(tssClient, &smux.Config{
+			Version:           2,
+			KeepAliveInterval: time.Minute * 10,
+			KeepAliveTimeout:  time.Minute * 40,
+			MaxFrameSize:      32768,
+			MaxReceiveBuffer:  100 * 1024,
+			MaxStreamBuffer:   100 * 1024,
+		})
+		if err != nil {
+			log.Println("Error negotiating smux from", rawClient.RemoteAddr(), err)
+			return
+		}
+		acceptStream = func() (n net.Conn, e error) {
+			n, e = muxSrv.AcceptStream()
+			return
+		}
 	case 'R':
 		err = handleResumable(slowLimit, tssClient)
 		log.Println("handleResumable returned with", err)
@@ -193,9 +216,9 @@ func handle(rawClient net.Conn) {
 		return
 	}
 	if slowLimit {
-		limiter = rate.NewLimiter(100*1000, 1000*1000)
+		limiter = slowLimitFactory.getLimiter(sessid)
 	}
-	smuxLoop(fmt.Sprintf("%v", strings.Split(tssClient.RemoteAddr().String(), ":")[0]), limiter, acceptStream)
+	smuxLoop(sessid, limiter, acceptStream)
 }
 
 type scEntry struct {
@@ -275,7 +298,7 @@ func handleResumable(slowLimit bool, tssClient net.Conn) (err error) {
 		}
 		var limiter *rate.Limiter
 		if slowLimit {
-			limiter = slowLimitFactory.getLimiter(clientHello.MetaSess)
+			limiter = slowLimitFactory.getLimiter(fmt.Sprintf("%x", clientHello.MetaSess))
 		} else {
 			limiter = infiniteLimit
 		}
@@ -312,7 +335,7 @@ func smuxLoop(sessid string, limiter *rate.Limiter, acceptStream func() (n net.C
 			soxclient.SetDeadline(time.Time{})
 			atomic.LoadUint64(&tunnCount)
 			timeout := time.Minute * 30
-			//log.Debugf("<%v> [%v] cmd %v", tc, timeout, command)
+			log.Debugf("[%v] cmd %v", timeout, command)
 			// match command
 			switch command[0] {
 			case "proxy":
